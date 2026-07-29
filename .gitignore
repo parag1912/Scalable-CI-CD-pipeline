@@ -1,1 +1,10 @@
 node_modules/
+
+# secrets / local config - never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+kubeconfig
+kubeconfig.yaml

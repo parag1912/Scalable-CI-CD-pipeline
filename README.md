@@ -6,7 +6,7 @@ A cloud-based platform for deploying frontend applications from Git repositories
 
 - **Automated Deployments**: Deploy applications directly from Git repositories
 - **Real-time Build Logs**: Stream build logs in real-time via WebSockets
-- **Scalable Architecture**: Built on AWS ECS Fargate for containerized, scalable builds
+- **Scalable Architecture**: Built on Kubernetes, with each build running as an isolated, ephemeral Job
 - **Subdomain Routing**: Each deployment gets a unique subdomain
 - **S3 Static Hosting**: Optimized hosting for static assets
 - **Modern UI**: Clean, responsive Next.js frontend with TailwindCSS
@@ -25,17 +25,17 @@ The system consists of four main components:
   - Deployment status tracking
 
 ### 2. API Server (`api-server/`)
-- **Technology**: Express.js, Socket.io, AWS SDK (ECS), Redis
+- **Technology**: Express.js, Socket.io, `@kubernetes/client-node`, Redis
 - **Purpose**: Orchestrates deployments and manages real-time communications
 - **Responsibilities**:
   - Accepts deployment requests
-  - Triggers AWS ECS Fargate tasks
+  - Authenticates in-cluster (via the `api-server-sa` ServiceAccount) and creates a Kubernetes `Job` per build
   - Manages WebSocket connections for log streaming
   - Redis pub/sub for log distribution
 
 ### 3. Build Server (`build-server/`)
 - **Technology**: Node.js, Docker, AWS SDK (S3), Redis
-- **Purpose**: Containerized build environment for cloning, building, and deploying projects
+- **Purpose**: Containerized build environment for cloning, building, and deploying projects. Runs as a Kubernetes `Job` — one Pod per deployment, torn down after it finishes.
 - **Workflow**:
   1. Clones Git repository
   2. Installs dependencies (`npm install`)
@@ -53,62 +53,52 @@ The system consists of four main components:
 ```
 User submits Git URL + slug
          ↓
-    API Server
+    API Server (Deployment)
          ↓
-  AWS ECS Fargate Task
+  BatchV1Api.createNamespacedJob()
          ↓
-   Build Server (Docker)
+   Build Server (Job → Pod, one per deploy)
          ↓
    Clone → Install → Build → Upload to S3
          ↓
+   Job completes and is garbage-collected (ttlSecondsAfterFinished)
+         ↓
    Logs → Redis → Socket.io → Frontend
          ↓
-   Access via subdomain
+   Access via subdomain (s3-reverse-proxy Deployment)
 ```
+
+api-server, frontend, and s3-reverse-proxy run as long-lived Kubernetes `Deployments`. Each build is a one-shot `Job` — there is no persistent build worker to manage or scale.
 
 ## Prerequisites
 
 - Node.js (v20 or higher)
 - Docker
-- AWS Account with:
-  - ECS Cluster configured
-  - S3 Bucket for builds
-  - IAM credentials with appropriate permissions
+- A Kubernetes cluster (kubectl configured with cluster-admin or equivalent to apply manifests)
+- A container registry (ECR, Docker Hub, GCR, etc.) — used purely as an image registry, unrelated to how builds are scheduled
+- AWS S3 Bucket for build output (used by `build-server` and `s3-reverse-proxy`; unrelated to how builds are scheduled)
 - Redis instance
 
 ## Configuration
 
 ### API Server Configuration
 
-Edit `api-server/index.js`:
+The API server authenticates to the Kubernetes API **in-cluster** using the `api-server-sa` ServiceAccount (see [`k8s/03-rbac.yaml`](k8s/03-rbac.yaml)) — no kubeconfig or static credentials are baked into the image. Configuration is via environment variables, set on the `api-server` Deployment (see [`k8s/01-api-server.yaml`](k8s/01-api-server.yaml)):
 
-```javascript
-// Redis connection
-const subscriber = new Redis('YOUR_REDIS_URL');
-
-// AWS ECS configuration
-const ecsCLient = new ECSClient({
-    region: 'YOUR_AWS_REGION',
-    credentials:{
-        accessKeyId:'YOUR_ACCESS_KEY',
-        secretAccessKey:'YOUR_SECRET_KEY'
-    }
-})
-
-const config = {
-    CLUSTER: 'YOUR_ECS_CLUSTER',
-    TASK: 'YOUR_TASK_DEFINITION'
-}
-
-// Update subnets and security groups
-networkConfiguration: {
-    awsvpcConfiguration: {
-        assignPublicIp: 'ENABLED',
-        subnets: ['subnet-1', 'subnet-2', ...],
-        securityGroups: ['sg-xxx']
-    }
-}
+```yaml
+env:
+  - name: K8S_NAMESPACE
+    value: app-deployer
+  - name: BUILD_SERVER_IMAGE
+    value: <YOUR_REGISTRY>/app-deployer-build-server:latest
+  - name: REDIS_URL
+    valueFrom:
+      secretKeyRef:
+        name: deployer-secrets
+        key: redis-url
 ```
+
+On each deploy request, the API server calls `BatchV1Api.createNamespacedJob()`, submitting a Job derived from [`k8s/02-build-job-template.yaml`](k8s/02-build-job-template.yaml) with `${DEPLOY_ID}` and `${GIT_REPO_URL}` substituted in for that request.
 
 ### Build Server Configuration
 
@@ -178,14 +168,23 @@ cd s3-reverse-proxy
 npm install
 ```
 
-### 5. Build Docker Image for Build Server
+### 5. Build and Push Docker Images
+
+Each component is containerized. Build and push all four images to your registry:
 
 ```bash
-cd build-server
-docker build -t build-server .
+docker build -t <YOUR_REGISTRY>/app-deployer-api-server:latest api-server/
+docker build -t <YOUR_REGISTRY>/app-deployer-build-server:latest build-server/
+docker build -t <YOUR_REGISTRY>/app-deployer-frontend:latest frontend/
+docker build -t <YOUR_REGISTRY>/app-deployer-s3-reverse-proxy:latest s3-reverse-proxy/
+
+docker push <YOUR_REGISTRY>/app-deployer-api-server:latest
+docker push <YOUR_REGISTRY>/app-deployer-build-server:latest
+docker push <YOUR_REGISTRY>/app-deployer-frontend:latest
+docker push <YOUR_REGISTRY>/app-deployer-s3-reverse-proxy:latest
 ```
 
-Push the image to your container registry (ECR, Docker Hub, etc.) and configure your ECS task definition to use it.
+Update the `image:` field in each manifest under [`k8s/`](k8s/) to point at your registry (they currently use the `<YOUR_REGISTRY>/...` placeholder).
 
 ## Running the Application
 
@@ -196,7 +195,7 @@ Push the image to your container registry (ECR, Docker Hub, etc.) and configure 
 cd api-server
 node index.js
 ```
-Runs on port 9000 (HTTP) and 9002 (WebSocket)
+Runs on port 9000 (HTTP) and 9002 (WebSocket). Locally (outside a cluster) this requires a reachable Kubernetes API — e.g. point `KUBECONFIG` at a local cluster (kind/minikube) and swap `kc.loadFromCluster()` for `kc.loadFromDefault()` for local dev.
 
 2. **Start S3 Reverse Proxy**:
 ```bash
@@ -212,18 +211,44 @@ npm run dev
 ```
 Runs on port 3000
 
-### Production Mode
+### Production Mode (Kubernetes)
 
-1. Build frontend:
+1. Create the namespace and RBAC first, since later manifests depend on them:
 ```bash
-cd frontend
-npm run build
-npm start
+kubectl apply -f k8s/00-namespace.yaml
+kubectl apply -f k8s/03-rbac.yaml
 ```
 
-2. Deploy API server and S3 reverse proxy to your hosting platform
-3. Ensure Build Server Docker image is available in your container registry
-4. Configure AWS ECS task definition
+2. Create the `deployer-secrets` Secret referenced by the manifests (Redis URL, S3 bucket, etc.) — not checked into the repo:
+```bash
+kubectl create secret generic deployer-secrets \
+  --namespace app-deployer \
+  --from-literal=redis-url='<YOUR_REDIS_URL>' \
+  --from-literal=s3-bucket='<YOUR_S3_BUCKET>'
+```
+
+3. Apply the long-running services:
+```bash
+kubectl apply -f k8s/01-api-server.yaml
+kubectl apply -f k8s/04-proxy-and-frontend.yaml
+```
+
+4. The build Job template (`k8s/02-build-job-template.yaml`) is **not** applied directly — the API server submits a Job derived from it via `BatchV1Api.createNamespacedJob()` on every deploy request. One Job → one Pod → one build, cleaned up automatically after `ttlSecondsAfterFinished`.
+
+```bash
+kubectl get deployments -n app-deployer
+kubectl get jobs -n app-deployer --watch
+```
+
+## Kubernetes Manifests (`k8s/`)
+
+| File | Kind(s) | Purpose |
+|---|---|---|
+| `00-namespace.yaml` | Namespace | `app-deployer` namespace all resources live in |
+| `01-api-server.yaml` | Deployment, Service | Long-running api-server |
+| `02-build-job-template.yaml` | Job | Template the api-server clones per build (`${DEPLOY_ID}`, `${GIT_REPO_URL}` substituted at request time) — not applied directly |
+| `03-rbac.yaml` | ServiceAccount, Role, RoleBinding | `api-server-sa`, scoped to create/list/watch/delete `jobs` and read `pods`/`pods/log` in-namespace |
+| `04-proxy-and-frontend.yaml` | Deployment, Service ×2 | Long-running s3-reverse-proxy and frontend |
 
 ## Usage
 
@@ -251,11 +276,11 @@ This includes:
 
 ## Architecture Decisions
 
-### Why AWS ECS Fargate?
-- Serverless container execution
-- No infrastructure management
-- Automatic scaling
-- Pay-per-use pricing
+### Why a Kubernetes Job per build?
+- Each build is isolated in its own Pod, with no shared state between builds
+- Pods are automatically cleaned up (`ttlSecondsAfterFinished`) once a build finishes
+- Scheduling, retries (`backoffLimit`), and resource limits are handled natively by the cluster
+- The container registry (ECR or otherwise) is just where images are pulled from — it's decoupled from how/where builds run
 
 ### Why Redis?
 - Fast pub/sub messaging
@@ -275,8 +300,8 @@ Before deploying to production:
 1. **Add Authentication**: Implement user authentication and authorization
 2. **Validate Git URLs**: Sanitize and validate repository URLs
 3. **Rate Limiting**: Add rate limiting to prevent abuse
-4. **Secure Credentials**: Use environment variables and AWS Secrets Manager
-5. **Network Security**: Configure VPC, security groups, and NACLs properly
+4. **Secure Credentials**: Use Kubernetes Secrets (or an external secrets manager) — never bake credentials into images or source
+5. **RBAC Scope**: Keep the `api-server-sa` Role scoped to only `jobs` and `pods`/`pods/log` in its own namespace (see [`k8s/03-rbac.yaml`](k8s/03-rbac.yaml)) — avoid cluster-wide permissions
 6. **CORS Configuration**: Restrict CORS to specific domains
 7. **Input Validation**: Validate all user inputs including slug format
 
@@ -284,7 +309,7 @@ Before deploying to production:
 
 - Only supports publicly accessible Git repositories
 - Requires `npm` as the package manager
-- Build must complete within ECS task timeout
+- Build must complete before the Job's `backoffLimit` is exhausted
 - No build caching (each build starts fresh)
 - Limited to static site deployments
 
@@ -303,9 +328,10 @@ Before deploying to production:
 ## Troubleshooting
 
 ### Builds Not Starting
-- Verify AWS credentials and permissions
-- Check ECS cluster and task definition configuration
-- Ensure subnets and security groups are correct
+- Check the api-server logs for RBAC errors (`Forbidden`) — verify `api-server-sa` has the `job-launcher` Role bound in its namespace ([`k8s/03-rbac.yaml`](k8s/03-rbac.yaml))
+- Confirm the api-server Deployment's pod spec sets `serviceAccountName: api-server-sa`
+- `kubectl get jobs -n app-deployer` / `kubectl describe job build-<slug> -n app-deployer` to see why a Job failed to schedule
+- Verify `BUILD_SERVER_IMAGE` points at a pullable image and `deployer-secrets` exists in the namespace
 
 ### Real-time Logs Not Appearing
 - Verify Redis connection in both API server and build server

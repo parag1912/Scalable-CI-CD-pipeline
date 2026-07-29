@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3-reverse-proxy
+  namespace: app-deployer
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: s3-reverse-proxy
+  template:
+    metadata:
+      labels:
+        app: s3-reverse-proxy
+    spec:
+      containers:
+        - name: s3-reverse-proxy
+          image: <YOUR_REGISTRY>/app-deployer-s3-reverse-proxy:latest
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3-reverse-proxy
+  namespace: app-deployer
+spec:
+  selector:
+    app: s3-reverse-proxy
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: app-deployer
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: <YOUR_REGISTRY>/app-deployer-frontend:latest
+          ports:
+            - containerPort: 3000
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: app-deployer
+spec:
+  selector:
+    app: frontend
+  ports:
+    - port: 3000
+      targetPort: 3000
+  type: ClusterIP

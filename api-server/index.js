@@ -1,5 +1,5 @@
 const express = require('express');
-const { ECSClient, RunTaskCommand} = require('@aws-sdk/client-ecs');
+const k8s = require('@kubernetes/client-node');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const {Server} = require('socket.io');
@@ -22,18 +22,12 @@ io.on('connection', socket => {
 
 io.listen(9002,()=>console.log('Socket server 9002'))
 
-const ecsCLient = new ECSClient({
-    region: '',
-    credentials:{
-        accessKeyId:'',
-        secretAccessKey:''
-    }
-})
+const kc = new k8s.KubeConfig();
+kc.loadFromCluster();
 
-const config = {
-    CLUSTER: '',
-    TASK: ''
-}
+const batchApi = kc.makeApiClient(k8s.BatchV1Api);
+const K8S_NAMESPACE = process.env.K8S_NAMESPACE || 'app-deployer';
+const BUILD_SERVER_IMAGE = process.env.BUILD_SERVER_IMAGE;
 
 // app.use(express.json)
 app.use(cors());
@@ -43,34 +37,47 @@ app.post('/project', async (req, res) => {
     const gitURL = req.body.gitURL;
     const projectSlug = req.body.slug;
 
-
-    // spin task
-    const command = new RunTaskCommand({
-        cluster: config.CLUSTER,
-        taskDefinition: config.TASK,
-        launchType: 'FARGATE',
-        count: 1,
-        networkConfiguration: {
-            awsvpcConfiguration: {
-                assignPublicIp: 'ENABLED',
-                subnets: ['', '', '', '', '', ''],
-                securityGroups: ['']
-            }
+    // spin up a build Job from the template, with DEPLOY_ID/GIT_REPO_URL substituted in
+    const jobManifest = {
+        apiVersion: 'batch/v1',
+        kind: 'Job',
+        metadata: {
+            name: `build-${projectSlug}`,
+            namespace: K8S_NAMESPACE,
+            labels: {app: 'build-server', deployId: projectSlug}
         },
-        overrides: {
-            containerOverrides: [
-                {
-                    name: 'builder-image',
-                    environment: [
-                        {name: 'GIT_REPOSITORY__URL', value: gitURL},
-                        {name: 'PROJECT_ID', value: projectSlug}
+        spec: {
+            backoffLimit: 2,
+            ttlSecondsAfterFinished: 3600,
+            template: {
+                metadata: {
+                    labels: {app: 'build-server', deployId: projectSlug}
+                },
+                spec: {
+                    restartPolicy: 'Never',
+                    containers: [
+                        {
+                            name: 'build-server',
+                            image: BUILD_SERVER_IMAGE,
+                            env: [
+                                {name: 'GIT_REPOSITORY__URL', value: gitURL},
+                                {name: 'DEPLOY_ID', value: projectSlug},
+                                {name: 'PROJECT_ID', value: projectSlug},
+                                {name: 'REDIS_URL', valueFrom: {secretKeyRef: {name: 'deployer-secrets', key: 'redis-url'}}},
+                                {name: 'S3_BUCKET', valueFrom: {secretKeyRef: {name: 'deployer-secrets', key: 's3-bucket'}}}
+                            ],
+                            resources: {
+                                requests: {cpu: '500m', memory: '512Mi'},
+                                limits: {cpu: '1', memory: '1Gi'}
+                            }
+                        }
                     ]
                 }
-            ]
+            }
         }
-    })
+    };
 
-    await ecsCLient.send(command);
+    await batchApi.createNamespacedJob({namespace: K8S_NAMESPACE, body: jobManifest});
 
     return res.status(200).send({status: 'queued', data: {projectSlug, url: `http://${projectSlug}.localhost:8000`}});
 })

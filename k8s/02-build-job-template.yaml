@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: build-${DEPLOY_ID}
+  namespace: app-deployer
+  labels:
+    app: build-server
+    deployId: "${DEPLOY_ID}"
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: build-server
+        deployId: "${DEPLOY_ID}"
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: build-server
+          image: <YOUR_REGISTRY>/app-deployer-build-server:latest
+          env:
+            - name: GIT_REPOSITORY__URL
+              value: "${GIT_REPO_URL}"
+            - name: DEPLOY_ID
+              value: "${DEPLOY_ID}"
+            - name: PROJECT_ID
+              value: "${DEPLOY_ID}"
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: deployer-secrets
+                  key: redis-url
+            - name: S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: deployer-secrets
+                  key: s3-bucket
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

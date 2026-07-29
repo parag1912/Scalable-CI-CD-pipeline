@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: app-deployer
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api-server
+  template:
+    metadata:
+      labels:
+        app: api-server
+    spec:
+      serviceAccountName: api-server-sa
+      containers:
+        - name: api-server
+          image: <YOUR_REGISTRY>/app-deployer-api-server:latest
+          ports:
+            - containerPort: 9000
+            - containerPort: 9002
+          env:
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: deployer-secrets
+                  key: redis-url
+            - name: K8S_NAMESPACE
+              value: app-deployer
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-server
+  namespace: app-deployer
+spec:
+  selector:
+    app: api-server
+  ports:
+    - name: http
+      port: 9000
+      targetPort: 9000
+    - name: ws
+      port: 9002
+      targetPort: 9002
+  type: ClusterIP
